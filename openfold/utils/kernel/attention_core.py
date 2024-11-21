@@ -103,4 +103,7 @@ class AttentionCoreFunction(torch.autograd.Function):
 
         return grad_q, grad_k, grad_v, grad_bias_1, grad_bias_2
 
-attention_core = AttentionCoreFunction.apply
+if attn_core_inplace_cuda is NotImplemented:
+    attention_core = NotImplemented
+else:
+    attention_core = AttentionCoreFunction.apply
