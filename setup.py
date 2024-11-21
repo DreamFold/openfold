@@ -15,11 +15,21 @@
 import os
 from setuptools import setup, Extension, find_packages
 import subprocess
+import sys
 
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
+import torch
+from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
 
 from scripts.utils import get_nvidia_cc
 
+DISABLE_CUDA_EXTENSION = False
+filtered_args = []
+for i, arg in enumerate(sys.argv):
+    if arg == '--disable-cuda-ext':
+        DISABLE_CUDA_EXTENSION = True
+        continue
+    filtered_args.append(arg)
+sys.argv = filtered_args
 
 version_dependent_macros = [
     '-DVERSION_GE_1_1',
@@ -37,83 +47,106 @@ extra_cuda_flags = [
 ]
 
 def get_cuda_bare_metal_version(cuda_dir):
-    raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True)
-    output = raw_output.split()
-    release_idx = output.index("release") + 1
-    release = output[release_idx].split(".")
-    bare_metal_major = release[0]
-    bare_metal_minor = release[1][0]
+    if cuda_dir==None or torch.version.cuda==None:
+        print("CUDA is not found, cpu version is installed")
+        return None, -1, 0
+    else:
+        raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True)
+        output = raw_output.split()
+        release_idx = output.index("release") + 1
+        release = output[release_idx].split(".")
+        bare_metal_major = release[0]
+        bare_metal_minor = release[1][0]
+        
+        return raw_output, bare_metal_major, bare_metal_minor
 
-    return raw_output, bare_metal_major, bare_metal_minor
-
-compute_capabilities = set([
-    (3, 7), # K80, e.g.
-    (5, 2), # Titan X
-    (6, 1), # GeForce 1000-series
-])
-
-compute_capabilities.add((7, 0))
-_, bare_metal_major, _ = get_cuda_bare_metal_version(CUDA_HOME)
-if int(bare_metal_major) >= 11:
-    compute_capabilities.add((8, 0))
-
-compute_capability, _ = get_nvidia_cc()
-if compute_capability is not None:
-    compute_capabilities = set([compute_capability])
-
-cc_flag = []
-for major, minor in list(compute_capabilities):
-    cc_flag.extend([
-        '-gencode',
-        f'arch=compute_{major}{minor},code=sm_{major}{minor}',
+kernel_package_data = {}
+modules = []
+cmdclass = {}
+if not DISABLE_CUDA_EXTENSION:
+    kernel_package_data = {"openfold": ['utils/kernel/csrc/*']}
+    cmdclass = {'build_ext': BuildExtension}
+    compute_capabilities = set([
+        (3, 7), # K80, e.g.
+        (5, 2), # Titan X
+        (6, 1), # GeForce 1000-series
     ])
+    compute_capabilities.add((7, 0))
 
-extra_cuda_flags += cc_flag
+    _, bare_metal_major, _ = get_cuda_bare_metal_version(CUDA_HOME)
+    if int(bare_metal_major) >= 11:
+        compute_capabilities.add((8, 0))
+
+    compute_capability, _ = get_nvidia_cc()
+    if compute_capability is not None:
+        compute_capabilities = set([compute_capability])
+
+    cc_flag = []
+    for major, minor in list(compute_capabilities):
+        cc_flag.extend([
+            '-gencode',
+            f'arch=compute_{major}{minor},code=sm_{major}{minor}',
+        ])
+
+    extra_cuda_flags += cc_flag
+
+    cc_flag = ['-gencode', 'arch=compute_70,code=sm_70']
+
+    if bare_metal_major != -1:
+        modules = [CUDAExtension(
+            name="attn_core_inplace_cuda",
+            sources=[
+                "openfold/utils/kernel/csrc/softmax_cuda.cpp",
+                "openfold/utils/kernel/csrc/softmax_cuda_kernel.cu",
+            ],
+            include_dirs=[
+                os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    'openfold/utils/kernel/csrc/'
+                )
+            ],
+            extra_compile_args={
+                'cxx': ['-O3'] + version_dependent_macros,
+                'nvcc': (
+                    ['-O3', '--use_fast_math'] +
+                    version_dependent_macros +
+                    extra_cuda_flags
+                ),
+            }
+        )]
+    else:
+        modules = [CppExtension(
+            name="attn_core_inplace_cuda",
+            sources=[
+                "openfold/utils/kernel/csrc/softmax_cuda.cpp",
+                "openfold/utils/kernel/csrc/softmax_cuda_stub.cpp",
+            ],
+            extra_compile_args={
+                'cxx': ['-O3'],
+            }
+        )]
 
 
 setup(
     name='openfold',
-    version='1.0.0',
+    version='2.0.0',
     description='A PyTorch reimplementation of DeepMind\'s AlphaFold 2',
-    author='Gustaf Ahdritz & DeepMind',
-    author_email='gahdritz@gmail.com',
+    author='OpenFold Team',
+    author_email='jennifer.wei@omsf.io',
     license='Apache License, Version 2.0',
     url='https://github.com/aqlaboratory/openfold',
     packages=find_packages(exclude=["tests", "scripts"]),
     include_package_data=True,
     package_data={
-        "openfold": ['utils/kernel/csrc/*'],
+        **kernel_package_data,
         "": ["resources/stereo_chemical_props.txt"]
     },
-    ext_modules=[CUDAExtension(
-        name="attn_core_inplace_cuda",
-        sources=[
-            "openfold/utils/kernel/csrc/softmax_cuda.cpp",
-            "openfold/utils/kernel/csrc/softmax_cuda_kernel.cu",
-        ],
-        include_dirs=[
-            os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                'openfold/utils/kernel/csrc/'
-            )
-        ],
-        extra_compile_args={
-            'cxx': ['-O3'] + version_dependent_macros,
-            'nvcc': (
-                ['-O3', '--use_fast_math'] +
-                version_dependent_macros +
-                extra_cuda_flags
-            ),
-        }
-    )],
-    cmdclass={'build_ext': BuildExtension},
+    ext_modules=modules,
+    cmdclass=cmdclass,
     classifiers=[
         'License :: OSI Approved :: Apache Software License',
         'Operating System :: POSIX :: Linux',
-        'Programming Language :: Python :: 3.7,'
+        'Programming Language :: Python :: 3.9,'
         'Topic :: Scientific/Engineering :: Artificial Intelligence',
     ],
 )
-
-
-
